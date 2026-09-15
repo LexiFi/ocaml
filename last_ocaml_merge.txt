@@ -1,0 +1,12 @@
+{
+ url = "https://github.com/ocaml/ocaml";
+ branch = "5.5.1";
+ commit = "56aa3e9fdfa8e2b81f3027c33f03c11d20c4b79b";
+ omit_from_local_diff =
+  [
+   "/asmcomp/intel_assembler.*"; "/.depend"; "/stdlib/.depend";
+   "/asmcomp/coff.*"; "/asmcomp/intel_coff.*"; "/configure";
+   "/lambda/transldynamic.*"; "/manual"; "/ocamltest"; "/testsuite";
+   "/stdlib/mlfi_types.*"; "/typing/typedynamic.*";
+  ];
+}
