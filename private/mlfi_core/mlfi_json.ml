@@ -12,35 +12,11 @@ open Mlfi_xtypes
 
 type error = string
 
-(* Logging *)
-let verbosity_var =
-  Mlfi_debug.register "JSON_VERBOSE"
-    ~help:"Enables Mlfi_json deserialization diagnostics"
-
-let logger = Mlfi_debug.create_logger ~verbosity_var "json"
-
 let string_of_json_path path =
   List.rev path |> String.concat "."
 
 let string_of_ttype t =
   Format.asprintf "%a" Mlfi_types.print_stype (Mlfi_types.stype_of_ttype t)
-
-let dump_to_string pos ~t x =
-  String.trim (Mlfi_debug.dump_s pos ~t x)
-
-let log_of_json_diagnostic ?pos ?path ?expected ?value category =
-  let details =
-    List.filter_map Fun.id
-      [
-        Option.map (fun pos -> Mlfi_debug.string_of_pos pos) pos;
-        Option.map (fun path -> Printf.sprintf "path=%s" (string_of_json_path path)) path;
-        Option.map (fun expected -> Printf.sprintf "expected=%s" expected) expected;
-        Option.map (fun value -> Printf.sprintf "value=%s" value) value;
-      ]
-  in
-  match details with
-  | [] -> Mlfi_debug.log ~logger ~verbose:() "%s" category
-  | _ -> Mlfi_debug.log ~logger ~verbose:() "%s: %s" category (String.concat "; " details)
 
 type number = I of int | F of float
 
@@ -53,9 +29,6 @@ module Number : sig
 
   val of_int: int -> t
   val of_float: float -> t (* does not check for nan/infinity *)
-
-  val to_variant: t -> Mlfi_isdatypes.variant
-  val of_variant: Mlfi_isdatypes.variant -> (t, string) result
 
   val repr: t -> number
 end = struct
@@ -83,24 +56,8 @@ end = struct
 
   let to_string = function
     | I x -> string_of_int x
-    | F x -> Dtoa.ecma_string_of_float x
-
-  let to_variant = function (* avoid wrapping with I/F constructors *)
-    | I x -> Mlfi_isdatypes.v_int x
-    | F x -> Mlfi_isdatypes.v_float x
-
-  let of_variant = function
-    | Mlfi_isdatypes.V_int x -> Ok (of_int x)
-    | Mlfi_isdatypes.V_float x -> Ok (of_float x) (* should check for nan/infinity *)
-    | _ -> Error "Mlfi_json.Number.of_variant"
+    | F x -> string_of_float x
 end
-
-let () =
-  Mlfi_isdatypes.safe_typed_add_abstract_type_variant
-    ~proxy_type:(Mlfi_types.stype_of_ttype [%t: Mlfi_isdatypes.variant])
-    ~read_variant:Number.of_variant
-    ~write_variant:Number.to_variant
-    ()
 
 type value =
   | Null
@@ -129,10 +86,6 @@ let object_ l = Object l
 
 let json_failure msg = raise (Json_failure msg)
 let json_failuref fmt = Printf.ksprintf json_failure fmt
-
-let json_failure_with_context ?pos ?path ?expected ?value msg =
-  log_of_json_diagnostic ?pos ?path ?expected ?value msg;
-  json_failure msg
 
 let protect f =
   try Ok (f ()) with
@@ -167,7 +120,7 @@ and of_json_override =
 let ctx ?(to_json_field=Fun.id) ?lossy ?to_json ?of_json () =
   {
     to_json_field;
-    lossy = Mlfi_option.unit_bool lossy;
+    lossy = lossy <> None;
     to_json;
     of_json;
   }
@@ -175,9 +128,15 @@ let ctx ?(to_json_field=Fun.id) ?lossy ?to_json ?of_json () =
 let empty_ctx = ctx ()
 
 let to_json_field ?allow_verbatim f =
-  if Mlfi_option.unit_bool allow_verbatim then
+  let drop_prefix ~prefix s =
+    if String.starts_with ~prefix s then
+      Some (String.sub s (String.length prefix) (String.length s - String.length prefix))
+    else
+      None
+  in
+  if allow_verbatim <> None then
     fun s ->
-      match Mlfi_string.drop_prefix ~prefix:"__" s with
+      match drop_prefix ~prefix:"__" s with
       | Some s -> s
       | None -> f s
   else
@@ -186,11 +145,23 @@ let to_json_field ?allow_verbatim f =
 let allow_verbatim_ctx () =
   ctx ~to_json_field:(to_json_field ~allow_verbatim:() Fun.id) ()
 
+let trim c s =
+  let len = String.length s in
+  let left = ref 0 in
+  let right = ref (len - 1) in
+  while !left <= !right && s.[ !left ] = c do
+    incr left
+  done;
+  while !right >= !left && s.[ !right ] = c do
+    decr right
+  done;
+  String.sub s !left (!right - !left + 1)
+
 let caml_case_ctx ?allow_verbatim () =
   let to_json_field =
     to_json_field ?allow_verbatim
       (fun s ->
-         Mlfi_string.trim ((=) '_') s
+         trim '_' s
          |> String.split_on_char '_'
          |> List.mapi (fun i s -> if i > 0 then String.capitalize_ascii s else s)
          |> String.concat ""
@@ -202,7 +173,7 @@ let pascal_case_ctx ?allow_verbatim () =
   let to_json_field =
     to_json_field ?allow_verbatim
       (fun s ->
-         Mlfi_string.trim ((=) '_') s
+         trim '_' s
          |> String.split_on_char '_'
          |> List.map String.capitalize_ascii
          |> String.concat ""
@@ -211,7 +182,7 @@ let pascal_case_ctx ?allow_verbatim () =
   ctx ~to_json_field ()
 
 let trim_fields_ctx () =
-  ctx ~to_json_field:(Mlfi_string.trim ((=) '_')) ()
+  ctx ~to_json_field:(trim '_') ()
 
 type 'a t_proxy = 'a ttype * ('a -> value) * (value -> 'a)
 type proxy = Proxy: 'a t_proxy -> proxy
@@ -312,54 +283,10 @@ type json_signal_handlers = {
   value: (value -> unit);
 }
 
-(* OPTIMs:
-
-   - also optimize the check against variant/value (to
-     be treated as part of the standard proxy stuff?)
-
-   - memoize the function (for a given set of flags)
-     in DT_node
-*)
-
-let rec variant_to_json_lossy = function
-  | Mlfi_isdatypes.V_unit -> Object []
-  | V_bool b -> Bool b
-  | V_int n -> Number (Number.of_int n)
-  | V_float x -> Number (Number.of_float x)
-  | V_string s -> String s
-  | V_date t -> String (Mlfi_date.to_string t)
-  | V_tuple vs | V_list vs -> Array (List.map variant_to_json_lossy vs)
-  | V_array va -> Array (Array.to_list (Array.map variant_to_json_lossy va))
-  | V_option None -> Null
-  | V_option (Some v) -> variant_to_json_lossy v
-  | V_record r -> Object (List.map (fun (s, v) -> s, variant_to_json_lossy v) (Mlfi_isdatypes.vrecord_fields r))
-  | V_constructor (s, None) -> Object ["type", String s]
-  | V_constructor (s, Some (V_record r)) ->
-      let l = Mlfi_isdatypes.vrecord_fields r in
-      Object (("type", String s) :: List.map (fun (s, v) -> s, variant_to_json_lossy v) l)
-  | V_constructor (s, Some v) -> Object ["type", String s; "val", variant_to_json_lossy v]
-  | V_variant v | V_lazy (lazy v) -> variant_to_json_lossy v
-
-let rec to_variant = function
-  | Null -> Mlfi_isdatypes.v_option_none
-  | Bool true -> Mlfi_isdatypes.v_bool_true
-  | Bool false -> Mlfi_isdatypes.v_bool_false
-  | Number x -> Number.to_variant x
-  | String "" -> Mlfi_isdatypes.v_string_empty
-  | String x -> Mlfi_isdatypes.v_string x
-  | Array [] -> Mlfi_isdatypes.v_list_empty
-  | Array x -> Mlfi_isdatypes.v_list (List.map to_variant x)
-  | Object [] -> Mlfi_isdatypes.v_unit
-  | Object x -> Mlfi_isdatypes.v_record (List.map (fun (k, v) -> k, to_variant v) x)
-
-let is_attribute t = Mlfi_types.ttypes_equality [%t: string * Mlfi_isdatypes.variant] t
-
 let is_json_attribute t = Mlfi_types.ttypes_equality [%t: string * value] t
 
 let as_json_string props =
   List.mem_assoc "as_json_string" props
-
-let variant_xtype = xtype_of_ttype [%t: Mlfi_isdatypes.variant]
 
 let rec list_iter_comma handlers f = function
   | [] -> ()
@@ -395,7 +322,6 @@ and to_json_stream_structural: type t. ctx -> t xtype -> (json_signal_handlers -
   | Int -> (fun handlers x -> handlers.int x)
   | Float -> float_to_json_stream
   | String -> (fun handlers x -> handlers.string x)
-  | Date -> (fun handlers x -> handlers.string (Mlfi_date.to_string x))
   | Option (_, lazy xt) ->
       begin match remove_first_props_xtype xt with
       | Option (_, lazy xt) ->
@@ -438,17 +364,8 @@ and to_json_stream_structural: type t. ctx -> t xtype -> (json_signal_handlers -
         )
       in
       if ctx.lossy then
-        begin match is_attribute tt, is_json_attribute tt with
-        | Some Eq, _ ->
-            (fun handlers x ->
-               handlers.object_open ();
-               list_iter_comma handlers (fun handlers (key, variant) ->
-                   handlers.object_field key;
-                   handlers.value (variant_to_json_lossy variant)
-                 ) x;
-               handlers.object_close ()
-            )
-        | _, Some Eq ->
+        begin match is_json_attribute tt with
+        | Some Eq ->
             (fun handlers x ->
                handlers.object_open ();
                list_iter_comma handlers (fun handlers (key, value) ->
@@ -457,7 +374,7 @@ and to_json_stream_structural: type t. ctx -> t xtype -> (json_signal_handlers -
                  ) x;
                handlers.object_close ()
             )
-        | None, None ->
+        | None ->
             default ()
         end
       else default ()
@@ -514,12 +431,6 @@ and to_json_stream_structural: type t. ctx -> t xtype -> (json_signal_handlers -
       end
   | Sum sum ->
       begin match Sum.path sum with
-      | "Mlfi_isdatypes.variant" ->
-          let Mlfi_types.TypEq.Eq = Option.get (Mlfi_types.ttypes_equality (Sum.ttype sum) [%t: Mlfi_isdatypes.variant]) in
-          if ctx.lossy then
-            (fun handlers x -> handlers.value (variant_to_json_lossy x))
-          else
-            (fun handlers x -> handlers.string (Mlfi_isdatypes.string_one_line_of_variant x))
       | "Mlfi_json.value" ->
           let Mlfi_types.TypEq.Eq = Option.get (Mlfi_types.ttypes_equality (Sum.ttype sum) [%t: value]) in
           (fun handlers x -> handlers.value x)
@@ -582,10 +493,7 @@ and to_json_stream_structural: type t. ctx -> t xtype -> (json_signal_handlers -
   | Object _ -> (fun _ _ -> json_failure "Mlfi_json: objects not supported")
   | Abstract (_, t, _) ->
       let stype = Mlfi_types.stype_of_ttype t in
-      let default () =
-        let variant_fn = to_json_stream_internal ctx variant_xtype in
-        (fun handlers x -> variant_fn handlers (Mlfi_isdatypes.variant ~t x))
-      in
+      let default () = json_failure "Mlfi_json: unsupported abstract type" in
       begin match stype with
       | DT_abstract (_, []) ->
           begin match find_proxy t with
@@ -709,18 +617,95 @@ let to_json_stream ctx t =
 let to_json ?(ctx=empty_ctx) ~t x =
   invalid_arg_of_json_failure (fun () -> to_json_internal ~ctx ~t x)
 
+(* Code taken from js_of_ocaml. *)
+
+let buffer_add_unicode_escape =
+  let conv = "0123456789abcdef" in
+  fun b c ->
+    Buffer.add_char b '\\';
+    Buffer.add_char b 'u';
+    Buffer.add_char b conv.[(c lsr 12) land 0xf];
+    Buffer.add_char b conv.[(c lsr 8) land 0xf];
+    Buffer.add_char b conv.[(c lsr 4) land 0xf];
+    Buffer.add_char b conv.[c land 0xf]
+
+let js_escaping_to_buf ~escape_single_quote ~escape_html_tags b s =
+  let l = String.length s in
+  let i = ref 0 in
+  let add_unicode_escape () =
+    let c =
+      let d = String.get_utf_8_uchar s !i in
+      i := !i + Uchar.utf_decode_length d;
+      decr i;
+      Uchar.to_int (Uchar.utf_decode_uchar d)
+    in
+    if c <= 0xFFFF then
+      buffer_add_unicode_escape b c
+    else
+      let c = c - 0x1_0000 in
+      let high_surrogate = (c lsr 10) land 0b11_1111_1111 + 0xD800 in
+      let low_surrogate = c land 0b11_1111_1111 + 0xDC00 in
+      buffer_add_unicode_escape b high_surrogate;
+      buffer_add_unicode_escape b low_surrogate;
+  in
+  while !i < l do
+    begin match s.[!i] with
+    | '\b' ->
+        Buffer.add_string b "\\b"
+    | '\t' ->
+        Buffer.add_string b "\\t"
+    | '\n' ->
+        Buffer.add_string b "\\n"
+    | '\012' ->
+        Buffer.add_string b "\\f"
+    | '\r' ->
+        Buffer.add_string b "\\r"
+    | '\"' ->
+        Buffer.add_string b "\\\""
+    | '\\' ->
+        Buffer.add_string b "\\\\"
+    | '\000' .. '\031' | '\127' .. '\255' ->
+        add_unicode_escape ()
+    | '\'' when escape_single_quote ->
+        add_unicode_escape ()
+    | '<' when escape_html_tags ->
+        (*To avoid that the browser interprets the <script/> tag in js parameters.*)
+        add_unicode_escape ()
+    | '\032' .. '\126' as c ->
+        Buffer.add_char b c (* could group consecutive bytes that don't need escaping and call add_string once *)
+    end;
+    incr i
+  done
+
+let rec check_no_escaping_needed_json s i =
+  i = String.length s ||
+  match s.[i] with | '\"' | '\\' -> false | '\032' .. '\126' -> check_no_escaping_needed_json s (i + 1) | _ -> false
+
+let js_escaping ~escape_single_quote ~escape_html_tags s =
+  let b = Buffer.create (4 * String.length s) in (* could be less pessimistic and/or reuse a global buffer *)
+  js_escaping_to_buf ~escape_single_quote ~escape_html_tags b s;
+  Buffer.contents b
+
+let json_escaping s =
+  if check_no_escaping_needed_json s 0 then s
+  else js_escaping ~escape_single_quote:false ~escape_html_tags:false s
+
+let json_escaping_to_buf buf s =
+  if check_no_escaping_needed_json s 0 then Buffer.add_string buf s
+  else js_escaping_to_buf ~escape_single_quote:false ~escape_html_tags:false buf s
+
 let string_handlers output =
   let rec handlers = {
     object_open = (fun () -> output "{");
-    object_field = (fun key -> output "\""; output (Mlfi_string.json_escaping key); output "\":");
+    object_field = (fun key -> output "\""; output (json_escaping key); output "\":");
     object_close = (fun () -> output "}");
     array_open = (fun () -> output "[");
     array_close = (fun () -> output "]");
     comma = (fun () -> output ",");
     int = (fun i -> output (string_of_int i));
-    float = (fun f -> output (Dtoa.ecma_string_of_float f));
+    float = (fun f -> output (string_of_float f));
     bool = (fun b -> output (string_of_bool b));
-    string = (fun s -> output "\""; output (Mlfi_string.json_escaping s); output "\"");
+    string = (fun s -> output "\""; output (json_escaping s); output "\"");
     null = (fun () -> output "null");
     value = (fun v -> value_to_signal_stream handlers v);
   }
@@ -736,15 +721,15 @@ let to_json_string_stream ?(ctx=empty_ctx) ~t output x =
 let buffer_handlers buf =
   let rec handlers = {
     object_open = (fun () -> Buffer.add_char buf '{');
-    object_field = (fun key -> Buffer.add_char buf '\"'; Mlfi_string.json_escaping_to_buf buf key; Buffer.add_string buf "\":");
+    object_field = (fun key -> Buffer.add_char buf '\"'; json_escaping_to_buf buf key; Buffer.add_string buf "\":");
     object_close = (fun () -> Buffer.add_char buf '}');
     array_open = (fun () -> Buffer.add_char buf '[');
     array_close = (fun () -> Buffer.add_char buf ']');
     comma = (fun () -> Buffer.add_char buf ',');
     int = (fun i -> Buffer.add_string buf (string_of_int i));
-    float = (fun f -> Buffer.add_string buf (Dtoa.ecma_string_of_float f));
+    float = (fun f -> Buffer.add_string buf (string_of_float f));
     bool = (fun b -> Buffer.add_string buf (string_of_bool b));
-    string = (fun s -> Buffer.add_char buf '\"'; Mlfi_string.json_escaping_to_buf buf s; Buffer.add_char buf '\"');
+    string = (fun s -> Buffer.add_char buf '\"'; json_escaping_to_buf buf s; Buffer.add_char buf '\"');
     null = (fun () -> Buffer.add_string buf "null");
     value = (fun v -> value_to_signal_stream handlers v);
   }
@@ -773,20 +758,12 @@ let to_json_string_internal ?(ctx = empty_ctx) ~t =
 let to_json_string ?(ctx = empty_ctx) ~t =
   fun x -> invalid_arg_of_json_failure (fun () -> to_json_string_internal ~ctx ~t x)
 
-let of_json_error t (x : value) =
-  json_failure_with_context
-    ~pos:__POS__
-    ~expected:(string_of_ttype t)
-    ~value:(dump_to_string __POS__ ~t:[%t: value] x)
-    "Type/value mismatch"
+let of_json_error _t (_x : value) =
+  json_failure "Type/value mismatch"
 
 let of_json_internal ?(ctx=empty_ctx) ~t x =
   let rec of_json: type t. t: t ttype -> value -> t = fun ~t x ->
     of_json_xtype (xtype_of_ttype t) [] x
-
-  and of_json_string: type t. t ttype -> value -> Mlfi_isdatypes.variant = fun t -> function
-    | String s -> Mlfi_isdatypes.variant_of_string s
-    | x -> of_json_error t x
 
   and of_json_xtype: type t. t xtype -> string list -> value -> t = fun t path v ->
     let tt = ttype_of_xtype t in
@@ -813,16 +790,6 @@ let of_json_internal ?(ctx=empty_ctx) ~t x =
     | Float, String "-Infinity" -> neg_infinity
     | Float, String "NaN" -> nan
     | String, String x -> x
-    | Date, String x ->
-        begin match Mlfi_date.of_string_opt x with
-        | Some t -> t
-        | None ->
-            json_failure_with_context
-              ~pos:__POS__
-              ~expected:(string_of_ttype [%t: Mlfi_date.t])
-              ~value:(Printf.sprintf "%S" x)
-              "Invalid date"
-        end
     | Option _, Null -> None
     | Option (_, lazy xt), x ->
         begin match remove_first_props_xtype xt with
@@ -839,18 +806,11 @@ let of_json_internal ?(ctx=empty_ctx) ~t x =
                 | "None" -> None
                 | "Some" -> Some (match arg with None -> None | Some arg -> Some (of_json_xtype xt ("(Some)":: path) arg))
                 | _ ->
-                    json_failure_with_context
-                      ~pos:__POS__
-                      ~path
-                      ~value:(dump_to_string __POS__ ~t:[%t: value] v)
+                    json_failure
                       "Nested option, 'type' field should be Some or None"
                 end
             | _ ->
-                json_failure_with_context
-                  ~pos:__POS__
-                  ~path
-                  ~expected:(string_of_ttype (Mlfi_xtypes.ttype_of_xtype t))
-                  ~value:(dump_to_string __POS__ ~t:[%t: value] v)
+                json_failure
                   "Type/value mismatch"
             end
         | _ ->
@@ -858,7 +818,7 @@ let of_json_internal ?(ctx=empty_ctx) ~t x =
         end
 
     | List (_, lazy xt), Array l -> List.map (of_json_xtype xt ("(_)" :: path)) l
-    | Array (_, lazy xt), Array l -> Mlfi_array.of_list_map (of_json_xtype xt ("[_]" :: path)) l
+    | Array (_, lazy xt), Array l -> Array.of_list (List.map (of_json_xtype xt ("[_]" :: path)) l)
     | Floatarray, Array l ->
         let x = Float.Array.create (List.length l) in
         List.iteri (fun i e -> Float.Array.set x i (of_json_xtype Float ("[[_]]" :: path) e)) l;
@@ -887,10 +847,6 @@ let of_json_internal ?(ctx=empty_ctx) ~t x =
         end
     | Sum sum, _ ->
         begin match Sum.path sum with
-        | "Mlfi_isdatypes.variant" ->
-            let t = Sum.ttype sum in
-            let Mlfi_types.TypEq.Eq = Option.get (Mlfi_types.ttypes_equality (Sum.ttype sum) [%t: Mlfi_isdatypes.variant]) in
-            of_json_string t v
         | "Mlfi_json.value" ->
             let Mlfi_types.TypEq.Eq = Option.get (Mlfi_types.ttypes_equality (Sum.ttype sum) [%t: value]) in
             v
@@ -935,12 +891,12 @@ let of_json_internal ?(ctx=empty_ctx) ~t x =
         begin match stype with
         | DT_abstract (_, []) ->
             begin match find_proxy t with
-            | None -> Mlfi_isdatypes.of_variant ~t (of_json_string t x)
+            | None -> json_failure "Unexpected abstract type"
             | Some (_, _, f) -> f x
             end
         | DT_abstract (s, [_]) ->
             begin match Hashtbl.find_opt abs1_tbl s with
-            | None -> Mlfi_isdatypes.of_variant ~t (of_json_string t x)
+            | None -> json_failure "Unexpected abstract type"
             | Some(module T : ABS1) ->
                 begin match T.is_t t with
                 | Some T.Is (t, Mlfi_types.TypEq.Eq) ->
@@ -949,268 +905,25 @@ let of_json_internal ?(ctx=empty_ctx) ~t x =
                 end
             end
         | _ ->
-            Mlfi_isdatypes.of_variant ~t (of_json_string t v)
+            json_failure "Unexpected abstract type"
         end
     | _ ->
-        json_failure_with_context
-          ~pos:__POS__
-          ~path
-          ~expected:(string_of_ttype (Mlfi_xtypes.ttype_of_xtype t))
-          ~value:(dump_to_string __POS__ ~t:[%t: value] v)
+        json_failure
           "Type/value mismatch"
 
   and get_constr l =
     match List.assoc_opt "type" l with
     | Some(String constr) -> constr
     | None ->
-        json_failure_with_context
-          ~pos:__POS__
-          ~value:(dump_to_string __POS__ ~t:[%t: (string * value) list] l)
-          "No 'type' field in object of sum type"
+        json_failure "No 'type' field in object of sum type"
     | Some _ ->
-        json_failure_with_context
-          ~pos:__POS__
-          ~value:(dump_to_string __POS__ ~t:[%t: (string * value) list] l)
-          "'type' field is not a string"
+        json_failure "'type' field is not a string"
 
   in
   of_json ~t x
 
 let of_json ?(ctx=empty_ctx) ~t x =
   protect (fun () -> of_json_internal ~ctx ~t x)
-
-module OpenAPI = struct
-
-  type components =
-    {
-      short_names: (string, int) Hashtbl.t;        (* Short name -> generation counter *)
-      schemas: (string, string * value) Hashtbl.t; (* Long name -> Short name * Schema *)
-    }
-
-  let empty_components () =
-    {
-      short_names = Hashtbl.create 3;
-      schemas = Hashtbl.create 3;
-    }
-
-  let component_schemas comps =
-    Mlfi_hashtbl.all_values comps.schemas
-    |> List.sort (fun (x, _) (y, _) -> String.compare x y)
-
-  let add_component comps rec_name f =
-    if Hashtbl.mem comps.schemas rec_name then invalid_arg __FUNCTION__;
-    let short_name =
-      match List.rev (String.split_on_char '.' rec_name) with
-      | "t" :: name :: _ -> String.uncapitalize_ascii name
-      | name :: _ -> name
-      | [] -> assert false
-    in
-    let short_name =
-      match Hashtbl.find_opt comps.short_names short_name with
-      | None ->
-          Hashtbl.add comps.short_names short_name 0;
-          short_name
-      | Some n ->
-          let n = n + 1 in
-          Hashtbl.replace comps.short_names short_name n;
-          short_name ^ "-" ^ string_of_int n
-    in
-    Hashtbl.add comps.schemas rec_name (short_name, Null);
-    let schema = f () in
-    Hashtbl.replace comps.schemas rec_name (short_name, schema);
-    short_name
-
-  let float_schema =
-    object_
-      [
-        "oneOf", array
-          [
-            object_ [ "type", string "number" ];
-            object_ [ "type", string "string"; "enum", array (List.map string ["Infinity"; "-Infinity"; "NaN"]) ];
-          ]
-      ]
-
-  let openapi_doc = "openapi_doc"
-
-  let rec schema_of_xtype : type t. _ -> ?nullable:bool -> t xtype -> value = fun comps ?(nullable = false) t ->
-    let mk l =
-      let l = if nullable then ("nullable", bool true) :: l else l in
-      object_ l
-    in
-    let type_ ?format typename =
-      let l = [ "type", string typename ] in
-      let l = match format with None -> l | Some format -> ("format", string format) :: l in
-      mk l
-    in
-    let array_ t = mk [ "type", string "array"; "items", schema_of_xtype comps t ] in
-    let ref_ rec_name f =
-      let short_name =
-        match Hashtbl.find_opt comps.schemas rec_name with
-        | Some (short_name, _) -> short_name
-        | None -> add_component comps rec_name f
-      in
-      mk [ "$ref", Printf.ksprintf string "#/components/schemas/%s" short_name ]
-    in
-    let object_ properties = mk [ "type", string "object"; "properties", object_ properties ] in
-    let not_supported () =
-      json_failuref "Type not supported: %s"
-        (Format.asprintf "%a" Mlfi_types.print_stype (Mlfi_types.stype_of_ttype (Mlfi_xtypes.ttype_of_xtype t)))
-    in
-    let any_type = object_ [] in
-    let props, t = Mlfi_xtypes.get_first_props_xtype t in
-    match t with
-    | Unit -> object_ []
-    | Bool -> type_ "boolean"
-    | Int -> type_ "integer"
-    | Float -> ref_ "float" (Fun.const float_schema)
-    | String -> type_ "string"
-    | Abstract ("bytes", _, []) -> type_ ~format:"byte" "string"
-    | Date -> type_ ~format:"date" "string"
-    | Char -> not_supported ()
-    | Int32 -> not_supported ()
-    | Int64 -> not_supported ()
-    | Nativeint -> not_supported ()
-    | Option (_, lazy t) ->
-        begin match remove_first_props_xtype t with
-        | Option _ ->
-            assert false
-        | _ ->
-            schema_of_xtype comps ~nullable:true t
-        end
-    | List (_, lazy t) -> array_ t
-    | Array (_, lazy t) -> array_ t
-    | Floatarray -> array_ Float
-    | Function _ -> not_supported ()
-    | Sum sum ->
-        begin match Sum.path sum with
-        | "Mlfi_isdatypes.variant" -> type_ "string"
-        | "Mlfi_json.value" -> any_type
-        | rec_name ->
-            if as_json_string props then
-              let enum =
-                Mlfi_array.map_to_list (fun (Constructor c) -> string (Constructor.name c))
-                  (Sum.constructors sum)
-              in
-              object_ [ "type", string "string"; "enum", array enum ]
-            else begin
-              match find_proxy (Sum.ttype sum) with
-              | None -> ref_ rec_name (fun () -> components_of_sum comps sum)
-              | Some _ -> not_supported ()
-            end
-        end
-    | Tuple _ -> not_supported ()
-    | Record r ->
-        begin match find_proxy (Record.ttype r) with
-        | None -> ref_ (Record.path r) (fun () -> components_of_record comps r)
-        | Some _ -> not_supported ()
-        end
-    | Lazy (_, lazy t) -> schema_of_xtype comps t
-    | Prop (_, _, lazy t) -> schema_of_xtype comps t
-    | Object _ -> not_supported ()
-    | Abstract _ -> not_supported ()
-
-  and schema_of_record : type t. components -> t Record.t -> _ = fun comps r ->
-    let fields = Record.fields r in
-    let properties =
-      List.map (fun (Field rf) ->
-          let t = xtype_of_ttype (RecordField.ttype rf) in
-          let required, doc, schema =
-            let rec go : type t. ?doc:_ -> t xtype -> _ = fun ?doc t ->
-              match t with
-              | Option (_, lazy t) -> false, doc, schema_of_xtype comps t
-              | Prop (props, _, lazy t) ->
-                  let doc =
-                    match List.assoc_opt openapi_doc props with
-                    | None -> doc
-                    | Some _ as doc -> doc
-                  in
-                  go ?doc t
-              | _ ->
-                  true, doc, schema_of_xtype comps t
-            in
-            let doc = List.assoc_opt openapi_doc (RecordField.props rf) in
-            go ?doc t
-          in
-          let schema =
-            match doc, schema with
-            | Some doc, Object l -> Object (("description", string doc) :: l)
-            | _ -> schema
-          in
-          RecordField.name rf, required, schema
-        ) fields
-    in
-    let required = List.filter_map (function (name, true, _) -> Some name | (_, false, _) -> None) properties in
-    let properties = List.map (fun (name, _, schema) -> name, schema) properties in
-    properties, required
-
-  and components_of_sum : type t. components -> t Sum.t -> value = fun comps sum ->
-    let constructors = Sum.constructors sum in
-    let constant_constructors, non_constant_constructors =
-      List.partition
-        (fun (Constructor c) ->
-           let t = Constructor.ttype c in
-           match Mlfi_types.ttypes_equality_modulo_props t [%t: unit] with
-           | Some Mlfi_types.TypEq.Eq -> true
-           | None -> false
-        ) (Array.to_list constructors)
-    in
-    let schemas =
-      List.map (fun (Constructor c) ->
-          let name = Constructor.name c in
-          let t = Constructor.ttype c in
-          let properties, required =
-            match xtype_of_ttype t with
-            | Record r ->
-                schema_of_record comps r
-            | t ->
-                [ "val", schema_of_xtype comps t ], [ "val" ]
-          in
-          let properties =
-            ("type", object_ [ "type", string "string"; "enum", array [ string name ] ]) ::
-            properties
-          in
-          let required =
-            "type" :: required
-          in
-          object_
-            [
-              "type", string "object";
-              "properties", object_ properties;
-              "required", array (List.map string required);
-            ]
-        ) non_constant_constructors
-    in
-    let schemas =
-      if constant_constructors = [] then
-        schemas
-      else
-        let constructor_names =
-          List.map (fun (Constructor c) -> Constructor.name c) constant_constructors
-        in
-        object_
-          [
-            "type", string "object";
-            "properties", object_ [ "type", object_ [ "type", string "string"; "enum", array (List.map string constructor_names) ] ];
-            "required", array [string "type"];
-          ] :: schemas
-    in
-    match schemas with
-    | [schema] -> schema
-    | _ -> object_ [ "oneOf", array schemas ]
-
-  and components_of_record : type t. components -> t Record.t -> value = fun comps r ->
-    let properties, required = schema_of_record comps r in
-    let required =
-      if required = [] then []
-      else ["required", array (List.map string required)]
-    in
-    object_ (("type", string "object") :: ("properties", object_ properties) :: required)
-
-  let schema_of_type_internal comps t = schema_of_xtype comps (xtype_of_ttype t)
-
-  let schema_of_type comps t =
-    invalid_arg_of_json_failure (fun () -> schema_of_type_internal comps t)
-end
 
 let buffer_add_cp b cp =
   Buffer.add_utf_8_uchar b (Uchar.of_int cp)
@@ -1422,7 +1135,7 @@ let json_parser (type t) (module J : JsonBuilder with type t = t) ?filename ~che
       | None -> ""
     in
     json_failuref "JSON parsing error at %sline %i, character %i: unexpected %s" filename line col
-      (if !i = n then "end of input" else Mlfi_string.of_char s.[!i])
+      (if !i = n then "end of input" else String.make 1 s.[!i])
 
 let decode_internal ?filename s =
   fst (json_parser (module JsonBuilder_noloc) ~check_eof:true ?filename s 0)
@@ -1479,7 +1192,7 @@ let default_pretty_options =
 
 let pp ppf x =
   let open Format in
-  let escape s = Printf.sprintf "\"%s\"" (Mlfi_string.json_escaping s) in
+  let escape s = Printf.sprintf "\"%s\"" (json_escaping s) in
   let pp_sep ppf () = pp_print_char ppf ','; pp_print_cut ppf () in
   let rec go ppf = function
     | Null -> pp_print_string ppf "null"
@@ -1522,100 +1235,6 @@ let to_pretty_string ?(options = default_pretty_options) x =
   | Some true -> encode x
   | _ -> Format.asprintf "%a" pp x
 
-let () =
-  let to_json bytes =
-    String (Mlfi_base64.encode bytes)
-  in
-  let of_json = function
-    | String s ->
-        (* backward compatibility  *)
-        if String.length s > 0 && s.[0] = '"' then
-          begin
-            try
-              Ok
-                (Mlfi_isdatypes.variant_of_string s
-                 |> Mlfi_isdatypes.of_variant ~t:[%t: bytes])
-            with
-            | Mlfi_isdatypes.Variant_parser {msg; loc; _} ->
-                Error (Printf.sprintf "%s (%s)" msg loc)
-            | Mlfi_isdatypes.Bad_type_for_variant _ ->
-                Error "Invalid variant representation for bytes"
-            | Failure msg ->
-                Error msg
-          end
-        else
-          begin
-            try Ok (Mlfi_base64.decode s) with
-            | Failure msg -> Error msg
-          end
-    | _ -> Error "Invalid JSON representation for bytes"
-  in
-  register_conversion ~t:[%t: bytes] ~to_json ~of_json
-
-let () =
-  let module M = struct
-    type 'a t = 'a Mlfi_sets_maps.StringMap.t
-    let t = [%t: unit Mlfi_sets_maps.StringMap.t]
-
-    let to_json ~(t:_ ttype) ?ctx map =
-      let f key value elts = (key, to_json_internal ~t ?ctx value) :: elts in
-      Object (Mlfi_sets_maps.StringMap.fold f map [])
-
-    let of_json ~(t:_ ttype) ?ctx = function
-      | Object elts ->
-          let f map (key, value) = Mlfi_sets_maps.StringMap.add key (of_json_internal ~t ?ctx value) map in
-          Ok (List.fold_left f Mlfi_sets_maps.StringMap.empty elts)
-      | _ -> Error "Invalid JSON representation for StringMap"
-  end
-  in
-  register_parametric_conversion (module M)
-
-let of_get_params get_params =
-  let try_json_decode s =
-    match decode s with
-    | Ok x -> x
-    | Error _ -> String s
-  in
-  match get_params with
-  | ["$value", s] -> try_json_decode (Mlfi_string.url_decode ~is_query_string_value:true s)
-  | _ ->
-      Object (
-        List.map
-          (fun (k, v) ->
-             k, try_json_decode (Mlfi_string.url_decode ~is_query_string_value:true v)
-          ) get_params
-      )
-
-let to_get_params x =
-  match x with
-  | Object fields ->
-      List.map
-        (fun (k, v) ->
-           k, encode v |> Mlfi_string.url_encode ~is_uri_component:()
-        ) fields
-  | _ -> ["$value", encode x |> Mlfi_string.url_encode ~is_uri_component:()]
-(*
-let () =
-  let s = "{\"hejsan\" : [  \"h\", \"e\"], \"x\": 56,\"z\": {\"bla\": false,   \"koko\":true}}" in
-  match decode s with
-  | Error e -> print_endline (string_of_error e)
-  | Ok x -> debug x
-*)
-
-(*
-let () =
-  let s =
-"{\"results\":[{\"value\":[[\"ForwardCurve_NBP_Mid_M11\", 796321.0356289984 ]] } ]}"
-  in
-  debug (decode s)
-*)
-
-(*
-let () =
-  let s = "{\"y\" : true, \"z\" : false}" in
-  debug (decode s)
-*)
-
 module Access = struct
 
   type step =
@@ -1628,7 +1247,6 @@ module Access = struct
     | TyString
     | TyBool
     | TyNumber
-    | TyDate
     | TyNull
 
   let string_of_typ = function
@@ -1637,7 +1255,6 @@ module Access = struct
     | TyString -> "string"
     | TyBool -> "bool"
     | TyNumber -> "number"
-    | TyDate -> "date"
     | TyNull -> "null"
 
   let typeof = function
@@ -1746,7 +1363,7 @@ module Access = struct
     | Number x -> Number.to_float x
     | v -> typerr TyNumber path v
 
-  let percentage = map Mlfi_float.div_100 float
+  let percentage = map (fun x -> x /. 100.) float
 
   let or_null q path = function
     | Null -> None
@@ -1755,14 +1372,6 @@ module Access = struct
   let or_null_empty q path = function
     | Null | String "" -> None
     | v -> Some (q path v)
-
-  let date path = function
-    | String s as v ->
-        begin match Mlfi_date.of_string_compact_or_not_opt s with
-        | None -> typerr TyDate path v
-        | Some t -> t
-        end
-    | v -> typerr TyDate path v
 
   let bool path = function
     | Bool b -> b
@@ -1856,7 +1465,7 @@ module Access = struct
 end
 
 let number x = Number x
-
+(*
 let () =
   register_conversion
     ~t:[%t: Mlfi_timestamp.t]
@@ -1868,108 +1477,4 @@ let () =
             | Some t -> Ok t
             | None -> Error (Printf.sprintf "Bad format for timestamp: %S" s)
             end
-        | _ -> Error "Bad type for timestamp")
-
-module Weighted = struct
-  type atom =
-    | Null
-    | Bool of bool
-    | Number of string
-    | String of string
-
-  type t = (int * desc) list
-  and desc =
-    | Atom of atom
-    | Array of t list
-    | Object of (string * t) list
-
-  let pp_atom = function
-    | Null -> "null"
-    | Bool x -> string_of_bool x
-    | String x -> x
-    | Number x -> x
-
-  let to_string l =
-    let b = Buffer.create 16 in
-    let indent level = Buffer.add_string b (String.make (level * 2) ' ') in
-    let total = List.fold_left (fun acc (x, _) -> acc + x) 0 l in
-    let rec show total level l =
-      List.iter
-        (fun (occ, d) ->
-           let prefix () =
-             indent level;
-             if occ <> total then Printf.bprintf b "[%.1f%%] " (((float_of_int occ) /. float_of_int total) *. 100.);
-           in
-           let sub s = function
-             | [ (occ2, Atom a) ] when occ = occ2 ->
-                 indent level;
-                 Printf.bprintf b "%s: %s\n" s (pp_atom a)
-             | x ->
-                 indent level;
-                 Printf.bprintf b "%s:\n" s;
-                 show occ (level + 1) x
-           in
-           match d with
-           | Atom a -> prefix (); Printf.bprintf b "%s\n" (pp_atom a)
-           | Array l ->
-               if occ <> total then (prefix (); Printf.bprintf b "array\n");
-               List.iteri (fun i x -> sub (string_of_int i) x) l
-           | Object l ->
-               if occ <> total then (prefix (); Printf.bprintf b "object\n");
-               List.iter (fun (k, x) -> sub k x) l
-        )
-        l
-    in
-    show total 0 l;
-    Buffer.contents b
-
-  type simple_value =
-    | Atom of atom
-    | Array
-    | Object
-
-  let to_simple_value : value -> simple_value = function
-    | Null -> Atom Null
-    | Bool b -> Atom (Bool b)
-    | Number n -> Atom (Number (Number.to_string n)) (* convert number here to produce the same string for 0 and 0. *)
-    | String s -> Atom (String s)
-    | Array _ -> Array
-    | Object _  -> Object
-
-  let cmp_simple_value s1 s2 =
-    match s1, s2 with
-    | Atom a1, Atom a2 -> Stdlib.compare a1 a2
-    | Atom _, (Array | Object)
-    | Array, Object -> -1
-    | Array, Array | Object, Object -> 0
-    | (Array | Object), Atom _
-    | Object, Array -> 1
-
-  let rec of_json_list : value list -> t = fun l ->
-    let n = List.length l in
-    let t = Hashtbl.create n in
-    List.iter (fun v -> Mlfi_hashtbl.add_assoc t (to_simple_value v) v) l;
-    Mlfi_hashtbl.to_list t
-    |> List.sort (fun (s1, _) (s2, _) -> cmp_simple_value s1 s2)
-    |> List.map
-      (fun (sv, l) ->
-         List.length l,
-         match sv with
-         | Atom a -> (Atom a : desc)
-         | Array ->
-             Array
-               (List.map (function (Array l : value) -> l | _ -> assert false) l
-                |> Mlfi_list.transpose
-                |> List.map of_json_list)
-         | Object ->
-             let rec add label v = function
-               | [] -> [ label, [ v ] ]
-               | (l1, vl1) :: tl when l1 = label -> (l1, v :: vl1) :: tl
-               | hd :: tl -> hd :: add label v tl
-             in
-             let l = List.fold_left (fun acc -> function (Object l : value) -> List.fold_left (fun acc (label, v) -> add label v acc) acc l | _ -> assert false) [] l in
-             Object (List.map (fun (label, vl) -> label, of_json_list (List.rev vl)) l)
-      )
-end
-
-let to_indent_based_string v = Weighted.to_string (Weighted.of_json_list [v])
+        | _ -> Error "Bad type for timestamp") *)

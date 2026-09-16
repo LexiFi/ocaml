@@ -249,7 +249,6 @@ type 'a xtype
   | Int: int xtype
   | Float: float xtype
   | String: string xtype
-  | Date: Mlfi_date.t xtype
   | Char: char xtype
   | Int32: int32 xtype
   | Int64: int64 xtype

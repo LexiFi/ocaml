@@ -77,17 +77,6 @@ type pretty_options =
 val to_pretty_string: ?options:pretty_options -> value -> string
 (** Prints a JSON tree into human-friendly text (multi-line, indentation). *)
 
-val to_indent_based_string: value -> string
-(** Prints a JSON tree into a stripped down human-friendly text (no braces, quotation marks not semicolons).
-
-    Example excerpt:
-
-    redemption_date: 2022-10-28
-    underlyings:
-      0:
-        bloomberg_ticker: BNP FP Equity
-*)
-
 type ctx
 (** Context storing serialization variations directives.
 
@@ -283,13 +272,6 @@ val of_json: ?ctx:ctx -> t:'a ttype -> value -> ('a, error) result
     and assuming that custom converters behaves properly).
 *)
 
-val variant_to_json_lossy: Mlfi_isdatypes.variant -> value
-(** A "lossy" conversion that maps variants to JSON values in a more idiomatic
-    way (None => Null, etc). *)
-
-val to_variant: value -> Mlfi_isdatypes.variant
-(** Satisfies: [variant_to_json_lossy (to_variant v) = v] *)
-
 (** {2 Custom mapping for specific types} *)
 
 val register_conversion:
@@ -322,20 +304,6 @@ val register_parametric_conversion: (module ABSTRACT_1_CONVERSION) -> unit
     mapping for a parametric abstract type.
 *)
 
-module OpenAPI : sig
-  type components
-
-  val schema_of_type: components -> 'a ttype -> value
-  (** Returns an OpenAPI description of the argument, according to the encoding
-      used by the [of_json] and [to_json] functions. *)
-
-  val empty_components: unit -> components
-  val component_schemas: components -> (string * value) list
-end
-
-val of_get_params: (string * string) list -> value
-val to_get_params: value -> (string * string) list
-
 module Access: sig
 
   type step =
@@ -352,7 +320,6 @@ module Access: sig
     | TyString
     | TyBool
     | TyNumber
-    | TyDate
     | TyNull
 
   type error_kind =
@@ -432,8 +399,6 @@ module Access: sig
   val or_null_empty: 'a t -> 'a option t
   (** [or_null_empty q] is [None] on [null] and empty string, and [q] otherwise. *)
 
-  val date: Mlfi_date.t t
-
   val bool: bool t
   (** [bool] is a parser that expects a JSON boolean, which it returns. *)
 
@@ -494,15 +459,6 @@ module Access: sig
     (** Same as {!app}. *)
   end
 end
-
-module Weighted: sig
-  type t
-  (** A weighted data structure used to visualize the differences between a list of JSON objects with similar format *)
-
-  val of_json_list : value list -> t
-  val to_string : t -> string
-end
-
 
 module Annotated : sig
   type 'a desc =

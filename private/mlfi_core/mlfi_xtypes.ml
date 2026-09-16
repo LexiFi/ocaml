@@ -356,10 +356,12 @@ let build_record (type s_) ttype record_repr record_fields : s_ Record.t =
         let (Field field) = Array.unsafe_get fields_arr 0 in
         Obj.magic (f.mk field)
   in
-  let tbl = lazy (Mlfi_string.Tbl.prepare (List.map (fun (Field f) -> f.name) fields)) in
+  let tbl =
+    lazy (let h = Hashtbl.create 0 in List.iteri (fun i (Field f) -> Hashtbl.add h f.name i) fields; h) in
   let find_field s =
-    let idx = Mlfi_string.Tbl.lookup (Lazy.force tbl) s in
-    if idx < 0 then None else Some (fields_arr.(idx))
+    match Hashtbl.find_opt (Lazy.force tbl) s with
+    | None -> None
+    | Some i -> Some (fields_arr.(i))
   in
   let find_field_typed f =
     match find_field (Mlfi_type_path.field_name f) with
@@ -481,8 +483,8 @@ let build_sum ttype variant_repr variant_constrs : _ Sum.t =
       )
       variant_constrs
   in
-  let cst_ids = Mlfi_array.of_list_rev !cst_ids in
-  let noncst_ids = Mlfi_array.of_list_rev !noncst_ids in
+  let cst_ids = Array.of_list (List.rev !cst_ids) in
+  let noncst_ids = Array.of_list (List.rev !noncst_ids) in
   let get_constructor_index =
     match variant_repr with
     | Variant_unboxed ->
@@ -493,8 +495,9 @@ let build_sum ttype variant_repr variant_constrs : _ Sum.t =
           if Obj.is_int x then Array.unsafe_get cst_ids (Obj.magic x)
           else Array.unsafe_get noncst_ids (Obj.tag x)
   in
-  let tbl = lazy (Mlfi_string.Tbl.prepare (List.map (fun (name, _, _) -> name) variant_constrs)) in
-  let lookup_constructor s = Mlfi_string.Tbl.lookup (Lazy.force tbl) s in
+  let tbl =
+    lazy (let h = Hashtbl.create 0 in List.iteri (fun i (name, _, _) -> Hashtbl.add h name i) variant_constrs; h) in
+  let lookup_constructor s = Hashtbl.find (Lazy.force tbl) s in
   {
     ttype;
     constructors = Array.of_list constructors;
@@ -586,7 +589,6 @@ type 'a xtype
   | Int: int xtype
   | Float: float xtype
   | String: string xtype
-  | Date: Mlfi_date.t xtype
   | Char: char xtype
   | Int32: int32 xtype
   | Int64: int64 xtype
@@ -610,7 +612,6 @@ let ttype_of_xtype : type t. t xtype -> t ttype = function
   | Int -> [%t: int]
   | Float -> [%t: float]
   | String -> [%t: string]
-  | Date -> [%t: Mlfi_date.t]
   | Char -> [%t: char]
   | Int32 -> [%t: int32]
   | Int64 -> [%t: int64]
@@ -656,7 +657,7 @@ let rec xtype_of_ttype (type s_) (s: s_ ttype) : s_ xtype =
   | DT_int -> Obj.magic Int
   | DT_float -> Obj.magic Float
   | DT_string -> Obj.magic String
-  | DT_date -> Obj.magic Date
+  | DT_date -> assert false
   | DT_list t -> Obj.magic (List (cast_ttype t, lazy (xtype_of_ttype (cast_ttype t))))
   | DT_array t -> Obj.magic (Array (cast_ttype t, lazy (xtype_of_ttype (cast_ttype t))))
   | DT_option t -> Obj.magic (Option (cast_ttype t, lazy (xtype_of_ttype (cast_ttype t))))
@@ -756,7 +757,6 @@ let rec all_paths: type root target. root:root ttype -> target:target ttype -> (
       | Int -> []
       | Float -> []
       | String -> []
-      | Date -> []
       | Char -> []
       | Int32 -> []
       | Int64 -> []
@@ -773,11 +773,11 @@ let rec all_paths: type root target. root:root ttype -> target:target ttype -> (
             (Record.fields record)
       | Sum sum ->
           List.concat
-            (Mlfi_array.map_to_list
+            (List.map
                (function (Constructor c) ->
                   let paths = all_paths ~target ~root:(Constructor.ttype c) in
                   List.map (Mlfi_type_path.(^^) (Constructor.path c)) paths)
-               (Sum.constructors sum))
+               (Array.to_list (Sum.constructors sum)))
       | Prop (_, t, _) -> all_paths ~target ~root:t
       | Object _ -> []
       | List _ -> []
@@ -798,7 +798,6 @@ let rec all_paths_value: type root target. root:root ttype -> target:target ttyp
       | Int -> []
       | Float -> []
       | String -> []
-      | Date -> []
       | Char -> []
       | Int32 -> []
       | Int64 -> []
@@ -872,6 +871,8 @@ let constructor_name ~t x =
       let Constructor c = Sum.constructor sum x in
       Constructor.name c
 
+module IntSet = Set.Make(Int)
+
 let smallest_size t =
   let rec aux seen = function
     | Mlfi_types.DT_tuple tl -> List.fold_left (fun acc t -> acc + aux seen t) 1 tl
@@ -881,9 +882,9 @@ let smallest_size t =
       -> 1
     | DT_prop (_, t) -> aux seen t
     | DT_var _ | DT_object _ | DT_polyvariant _ | DT_arrow _ -> raise_notrace Exit
-    | DT_node n when Mlfi_sets_maps.IntSet.mem n.Mlfi_types.rec_uid seen -> raise_notrace Exit
+    | DT_node n when IntSet.mem n.Mlfi_types.rec_uid seen -> raise_notrace Exit
     | DT_node n ->
-        let seen = Mlfi_sets_maps.IntSet.add n.rec_uid seen in
+        let seen = IntSet.add n.rec_uid seen in
         match n.rec_descr with
         | DT_variant {variant_constrs = l; _} ->
             let n = min_constr seen l in
@@ -902,7 +903,7 @@ let smallest_size t =
       max_int
       l
   in
-  try aux Mlfi_sets_maps.IntSet.empty t
+  try aux IntSet.empty t
   with Exit -> max_int
 
 let default_value_reaches_node {Mlfi_types.rec_uid; _} s =
@@ -1029,7 +1030,6 @@ let to_dot: type a. ?override:override -> t:a ttype -> Format.formatter -> a -> 
     | Int -> node id (string_of_int x)
     | Float -> node id (string_of_float x)
     | String -> node id (Printf.sprintf "%S" x)
-    | Date -> node id (Mlfi_date.to_string x)
     | Char -> node id (Printf.sprintf "%C" x)
     | Int32 -> node id (Int32.to_string x)
     | Int64 -> node id (Int64.to_string x)
@@ -1113,7 +1113,6 @@ let rec has_subterm: type t u. t:t ttype -> u:u ttype -> (u -> bool) -> t -> boo
       | Int
       | Float
       | String
-      | Date
       | Char
       | Int32
       | Int64
